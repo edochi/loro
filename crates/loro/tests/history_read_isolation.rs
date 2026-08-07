@@ -28,7 +28,8 @@
 //! flakier.
 #![cfg(not(loom))]
 
-use loro::{Frontiers, LoroDoc};
+use loro::{ContainerID, Frontiers, LoroDoc, UndoManager, UndoScope};
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -214,5 +215,72 @@ fn fork_at_never_exposes_an_intermediate_version_to_a_reader() {
         observations.violations.is_empty(),
         "{}",
         observations.report("fork_at")
+    );
+}
+
+/// How many committed edits to record as undo entries. Each one gives the
+/// undo below a separate span to walk history over, and so a separate window in
+/// which a racing reader could catch the document parked at an older version.
+const UNDO_ENTRIES: usize = 64;
+
+/// A document whose undo, though it computes by walking history, never moves the
+/// document off its resting version — so the resting version stays single and
+/// any other version a reader sees is a violation.
+///
+/// `undo` normally applies its result, which would advance the document to a new
+/// version and leave the race with more than one legitimate resting version. The
+/// manager here is scoped to an empty set of containers, so the diff each undo
+/// computes is masked away to nothing before it is applied. Computing that diff
+/// still walks the document back through history and forward again — the very
+/// window under test — but applying an empty diff changes no counter, so the undo
+/// is treated as a no-op: the entry is dropped and the next one walked, without
+/// the document ever leaving where it rests. A single `undo` call therefore walks
+/// history once per recorded entry while the resting version stays put.
+fn doc_with_masked_undo_entries() -> (LoroDoc, UndoManager, Frontiers) {
+    let doc = LoroDoc::new();
+    let mut manager = UndoManager::new(&doc);
+    for i in 0..UNDO_ENTRIES {
+        doc.get_text("text").insert(0, "x").unwrap();
+        doc.commit();
+        // Force each commit into its own undo entry rather than letting adjacent
+        // ones merge, so the count of history walks is predictable.
+        manager.record_new_checkpoint().unwrap();
+        assert_eq!(
+            manager.undo_count(),
+            i + 1,
+            "each commit should record its own undo entry"
+        );
+    }
+
+    // Scope the manager to no containers, so every undo's diff is masked empty
+    // and applied as a no-op — the document keeps its resting version while the
+    // undo still walks history to compute that diff.
+    manager.set_scope(UndoScope::containers(std::iter::empty::<ContainerID>()));
+
+    let resting = doc.state_frontiers();
+    (doc, manager, resting)
+}
+
+/// Undo walks the live document back through history and forward again to compute
+/// its diff. If it releases the state lock between those moves, a reader on
+/// another thread can observe the document at a version it only passes through.
+///
+/// The masked-scope manager keeps the document at rest throughout (see
+/// [`doc_with_masked_undo_entries`]), so the resting version is the only
+/// legitimate one and the oracle can be the version, never the text.
+#[test]
+fn undo_never_exposes_an_intermediate_version_to_a_reader() {
+    let (doc, manager, resting) = doc_with_masked_undo_entries();
+    let manager = RefCell::new(manager);
+    let observations = race_reader_against(doc, resting, move |_doc| {
+        // The first call walks history once per recorded entry, draining the
+        // stack; later calls find nothing to undo and return at once. Either way
+        // the document never leaves its resting version.
+        let _ = manager.borrow_mut().undo();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("undo")
     );
 }

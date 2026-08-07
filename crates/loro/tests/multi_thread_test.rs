@@ -302,6 +302,77 @@ mod loom_test {
         });
     }
 
+    /// Finishing a history walk must not leave the document flagged attached
+    /// while its state is behind its oplog.
+    ///
+    /// `diff` marks the document detached while it walks and clears the flag at
+    /// the end, holding the transaction lock across that clear. An import blocks
+    /// on that lock, so once it proceeds it must see the flag already cleared and
+    /// apply its ops to state. If the lock were released before the flag were
+    /// cleared, an interleaving exists where the import acquires the lock while
+    /// the flag still reads detached, takes the oplog-only branch that skips
+    /// state, and is then stranded when the flag is cleared over the now-stale
+    /// state — permanently, since checkout-to-latest early-returns while
+    /// attached.
+    ///
+    /// The oracle is oplog/state agreement under the attached flag: a healthy
+    /// attached document has applied every op in its oplog to its state, so the
+    /// two frontiers are equal. A skipped import leaves the state frontier behind
+    /// while the flag still reads attached — a state no legal interleaving
+    /// reaches. This race hinges on the flag/lock ordering and its window is a
+    /// few instructions wide, so only exhaustive schedule exploration exercises
+    /// it; a wall-clock stress test does not.
+    #[test]
+    fn diff_teardown_never_leaves_the_document_attached_over_stale_state() {
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 10_000;
+        builder.check(|| {
+            let doc = LoroDoc::new();
+            doc.get_text("text").insert(0, "a").unwrap();
+            doc.commit();
+            let v0 = doc.state_frontiers();
+            doc.get_text("text").insert(1, "b").unwrap();
+            doc.commit();
+            let v1 = doc.state_frontiers();
+
+            // One remote op to import, prepared by a peer sharing this history
+            // under a distinct id. Built before the threads spawn, so the setup
+            // adds no schedules to explore.
+            let peer = LoroDoc::new();
+            peer.import(&doc.export(ExportMode::Snapshot).unwrap())
+                .unwrap();
+            peer.set_peer_id(2).unwrap();
+            peer.get_text("text").insert(0, "c").unwrap();
+            peer.commit();
+            let blob = peer.export(ExportMode::updates(&doc.oplog_vv())).unwrap();
+
+            let doc1 = doc.clone();
+            let doc2 = doc.clone();
+            let a = v0.clone();
+            let b = v1.clone();
+
+            let h0 = loom::thread::spawn(move || {
+                doc1.diff(&a, &b).unwrap();
+            });
+            let h1 = loom::thread::spawn(move || {
+                doc2.import(&blob).unwrap();
+            });
+
+            h0.join().unwrap();
+            h1.join().unwrap();
+
+            if !doc.is_detached() {
+                assert_eq!(
+                    doc.state_frontiers(),
+                    doc.oplog_frontiers(),
+                    "the document is flagged attached but its state is behind its \
+                     oplog: an import was recorded into the oplog without being \
+                     applied to state"
+                );
+            }
+        });
+    }
+
     #[test]
     fn concurrently_import_export() {
         let mut builder = loom::model::Builder::new();

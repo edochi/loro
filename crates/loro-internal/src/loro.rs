@@ -1207,42 +1207,97 @@ impl LoroDoc {
             return Err(LoroError::UndoInvalidIdSpan(id_span.id_last()));
         }
 
-        let (was_recording, latest_frontiers) = {
-            let mut state = self.state.lock();
-            let was_recording = state.is_recording();
-            state.stop_and_clear_recording();
-            (was_recording, state.frontiers.clone())
-        };
+        // Hold the oplog and state locks across the whole undo walk. Computing the
+        // undo diff moves the live document back through history and forward
+        // again, once or twice per span; each move on its own parks the state at a
+        // version the document never rests at, so a reader that took the state
+        // lock between two of them would be answered with a version that was never
+        // true. Holding both locks for the whole walk makes such a reader wait
+        // instead. The acquisition order is the group's fixed one: transaction
+        // (already held), then oplog, then state.
+        let oplog = self.oplog.lock();
+        let spans = oplog.split_span_based_on_deps(id_span);
+        let mut state = self.state.lock();
+        let was_recording = state.is_recording();
+        state.stop_and_clear_recording();
+        let latest_frontiers = state.frontiers.clone();
 
-        let spans = self.oplog.lock().split_span_based_on_deps(id_span);
-        let diff = crate::undo::undo(
+        let undo_result = crate::undo::undo(
             spans,
             match post_transform_base {
                 Some(d) => Either::Right(d),
                 None => Either::Left(&latest_frontiers),
             },
             |from, to| {
-                self._checkout_without_emitting(from, false, false).unwrap();
-                self.state.lock().start_recording();
-                self._checkout_without_emitting(to, false, false).unwrap();
-                let mut state = self.state.lock();
+                self._checkout_without_emitting_with_guards(
+                    &oplog,
+                    &mut state,
+                    from,
+                    false,
+                    "checkout".into(),
+                    EventTriggerKind::Checkout,
+                )?;
+                state.start_recording();
+                self._checkout_without_emitting_with_guards(
+                    &oplog,
+                    &mut state,
+                    to,
+                    false,
+                    "checkout".into(),
+                    EventTriggerKind::Checkout,
+                )?;
                 let e = state.take_events();
                 state.stop_and_clear_recording();
-                DiffBatch::new(e)
+                Ok(DiffBatch::new(e))
             },
-            before_diff,
         );
 
         // println!("\nundo_internal: diff: {:?}", diff);
         // println!("container remap: {:?}", container_remap);
 
-        self._checkout_without_emitting(&latest_frontiers, false, false)?;
+        // Restore the document to where it rested before the walk, still under the
+        // held locks so the restoring move is as unobservable as the rest of the
+        // walk.
+        let restored = self._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &latest_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        );
+        drop(state);
+        drop(oplog);
+        // Keep the transaction guard held across `set_detached(false)`. Clearing
+        // the flag is what marks the document attached again; a concurrent import
+        // that acquired the transaction between here and that clear would see the
+        // document still detached and record its ops into the oplog only, never
+        // into state — and the subsequent clear would then leave the document
+        // flagged attached over stale state, which no later checkout repairs.
+        // Holding the transaction until the flag is clear makes such an import
+        // wait until the document is consistent.
+        //
+        // A failed restore or walk leaves the document detached: the early return
+        // drops the transaction guard without clearing the flag, which is the safe
+        // read-only state rather than a fresh transaction built on the wrong state.
+        restored?;
+        let (diff, last_event_a) = undo_result?;
         self.set_detached(false);
         if was_recording {
             self.state.lock().start_recording();
         }
         drop(txn);
         self.start_auto_commit();
+
+        // The last span's undo delta is applied to the caller's own bookkeeping
+        // here, with no document lock held. This used to happen through a callback
+        // invoked mid-walk; the same undo manager mutex is also taken on paths
+        // that reach for document locks, so running it inside the locked walk was
+        // a lock-ordering hazard. Doing it here removes the hazard structurally.
+        // The transaction guard is dropped above, so this holds no document lock.
+        if let Some(last_event_a) = last_event_a {
+            before_diff(&last_event_a);
+        }
 
         // If a scope filter was supplied (UndoManager with UndoScope::Containers),
         // mask the diff so only in-scope containers are reverted. This is what
@@ -1367,15 +1422,26 @@ impl LoroDoc {
         );
         drop(state);
         drop(oplog);
-        drop(txn);
-        // A failed restore has left the document at a version it should not rest
-        // at. Re-attaching it or renewing auto-commit below would place a fresh
-        // transaction on top of that wrong state and let a later edit fork history
-        // silently, so surface the error first and leave the document detached —
-        // the safe read-only state — rather than papering over it.
+        // Keep the transaction guard held across `set_detached(false)`. Clearing
+        // the flag is what marks the document attached again; a concurrent import
+        // that acquired the transaction between here and that clear would see the
+        // document still detached and record its ops into the oplog only, never
+        // into state — and the subsequent clear would then leave the document
+        // flagged attached over stale state, which no later checkout repairs.
+        // Holding the transaction until the flag is clear makes such an import
+        // wait until the document is consistent.
+        //
+        // A failed restore leaves the document detached: the early return drops
+        // the transaction guard without clearing the flag, which is the safe
+        // read-only state rather than a fresh transaction built on the wrong state.
         restored?;
         if !was_detached {
             self.set_detached(false);
+        }
+        // Release the transaction before renewing auto-commit: renewal re-locks
+        // the same transaction mutex, so it must not run under the held guard.
+        drop(txn);
+        if !was_detached {
             self.renew_txn_if_auto_commit(options);
         }
         if was_recording {

@@ -1067,17 +1067,17 @@ impl UndoManager {
 ///   - `IdSpan`: Represents a span of operations identified by an ID.
 ///   - `Frontiers`: Represents the deps of the given id_span
 /// - `latest_frontiers`: The latest frontiers of the document
-/// - `calc_diff`: A closure that takes two `Frontiers` and calculates the difference between them, returning a `DiffBatch`.
+/// - `calc_diff`: A closure that takes two `Frontiers` and calculates the difference between them, returning a `DiffBatch`. It may fail if a move between the two versions fails, and the error is propagated to the caller.
 ///
 /// # Returns
 ///
 /// - `DiffBatch`: Applying this batch on the `latest_frontiers` will undo the ops in the given spans.
+/// - `Option<DiffBatch>`: the untransformed undo delta of the last span (`A'` for the final span), captured before it is transformed against `B`. The caller applies this to its own bookkeeping once it has released any document locks it held across the walk, rather than having it delivered through a callback mid-walk. It is `None` only when `spans` is empty, in which case the primary `DiffBatch` cannot be produced either.
 pub(crate) fn undo(
     spans: Vec<(IdSpan, Frontiers)>,
     last_frontiers_or_last_bi: Either<&Frontiers, &DiffBatch>,
-    calc_diff: impl Fn(&Frontiers, &Frontiers) -> DiffBatch,
-    on_last_event_a: &mut dyn FnMut(&DiffBatch),
-) -> DiffBatch {
+    mut calc_diff: impl FnMut(&Frontiers, &Frontiers) -> LoroResult<DiffBatch>,
+) -> LoroResult<(DiffBatch, Option<DiffBatch>)> {
     // The process of performing undo is:
     //
     // 0. Split the span into a series of continuous spans. There is no external dep within each continuous span.
@@ -1096,8 +1096,9 @@ pub(crate) fn undo(
     // -------------------------------------------------------
 
     let mut last_ci: Option<DiffBatch> = None;
+    let mut last_event_a: Option<DiffBatch> = None;
     for i in 0..spans.len() {
-        debug_span!("Undo", ?i, "Undo span {:?}", &spans[i]).in_scope(|| {
+        debug_span!("Undo", ?i, "Undo span {:?}", &spans[i]).in_scope(|| -> LoroResult<()> {
             let (this_id_span, this_deps) = &spans[i];
             // ---------------------------------------
             // 1.a Calc event A_i
@@ -1105,7 +1106,7 @@ pub(crate) fn undo(
             let mut event_a_i = debug_span!("1. Calc event A_i").in_scope(|| {
                 // Checkout to the last id of the id_span
                 calc_diff(&this_id_span.id_last().into(), this_deps)
-            });
+            })?;
 
             // println!("event_a_i: {:?}", event_a_i);
 
@@ -1122,7 +1123,7 @@ pub(crate) fn undo(
                         Either::Right(right) => break 'block right,
                     }
                 };
-                stack_diff_batch = Some(calc_diff(&this_id_span.id_last().into(), &next));
+                stack_diff_batch = Some(calc_diff(&this_id_span.id_last().into(), &next)?);
                 stack_diff_batch.as_ref().unwrap()
             };
 
@@ -1140,8 +1141,12 @@ pub(crate) fn undo(
             } else {
                 event_a_i
             };
+            // Capture the last span's undo delta before it is transformed against
+            // B_i. It used to be handed to a callback here, but that ran while the
+            // document was mid-walk; returning it lets the caller apply it once the
+            // walk is over and any locks are released.
             if i == spans.len() - 1 {
-                on_last_event_a(&event_a_prime);
+                last_event_a = Some(event_a_prime.clone());
             }
             // --------------------------------------------------
             // 3. Transform event A'_i based on B_i, call it C_i
@@ -1152,8 +1157,9 @@ pub(crate) fn undo(
 
             let c_i = event_a_prime;
             last_ci = Some(c_i);
-        });
+            Ok(())
+        })?;
     }
 
-    last_ci.unwrap()
+    Ok((last_ci.unwrap(), last_event_a))
 }
