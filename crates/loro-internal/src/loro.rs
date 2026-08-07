@@ -1321,27 +1321,59 @@ impl LoroDoc {
 
         let (options, txn) = self.implicit_commit_then_stop();
         let was_detached = self.is_detached();
-        let old_frontiers = self.state_frontiers();
-        let was_recording = {
-            let mut state = self.state.lock();
-            let is_recording = state.is_recording();
-            state.stop_and_clear_recording();
-            is_recording
-        };
+
+        // The oplog and state locks are held across the whole walk — down to `a`,
+        // forward to `b`, then back to where the state started. Each move on its
+        // own leaves the state at a version the document never rests at, so a
+        // reader that took the state lock between two of them would be answered
+        // with a version that was never true. Holding both locks for the whole
+        // journey makes such a reader wait instead.
+        let oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        let old_frontiers = state.frontiers.clone();
+        let was_recording = state.is_recording();
+        state.stop_and_clear_recording();
         let result = (|| {
-            self._checkout_without_emitting(a, true, false)?;
-            self.state.lock().start_recording();
-            self._checkout_without_emitting(b, true, false)?;
-            let mut state = self.state.lock();
+            self._checkout_without_emitting_with_guards(
+                &oplog,
+                &mut state,
+                a,
+                true,
+                "checkout".into(),
+                EventTriggerKind::Checkout,
+            )?;
+            state.start_recording();
+            self._checkout_without_emitting_with_guards(
+                &oplog,
+                &mut state,
+                b,
+                true,
+                "checkout".into(),
+                EventTriggerKind::Checkout,
+            )?;
             let e = state.take_events();
             state.stop_and_clear_recording();
             Ok::<_, LoroError>(e)
         })();
 
         // Always restore state regardless of whether diff calculation succeeded
-        self._checkout_without_emitting(&old_frontiers, false, false)
-            .unwrap();
+        let restored = self._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &old_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        );
+        drop(state);
+        drop(oplog);
         drop(txn);
+        // A failed restore has left the document at a version it should not rest
+        // at. Re-attaching it or renewing auto-commit below would place a fresh
+        // transaction on top of that wrong state and let a later edit fork history
+        // silently, so surface the error first and leave the document detached —
+        // the safe read-only state — rather than papering over it.
+        restored?;
         if !was_detached {
             self.set_detached(false);
             self.renew_txn_if_auto_commit(options);
@@ -1718,11 +1750,50 @@ impl LoroDoc {
         )
     }
 
+    /// Acquires the oplog and state locks and moves the state to `frontiers`.
+    ///
+    /// This is the entry point for callers that hold neither lock. Callers that
+    /// need several moves to be indivisible — so that no reader can observe a
+    /// version the state is only passing through — should acquire the two locks
+    /// themselves and call [`Self::_checkout_without_emitting_with_guards`]
+    /// once per move instead.
     fn _checkout_without_emitting_with_event(
         &self,
         frontiers: &Frontiers,
         to_shrink_frontiers: bool,
         _to_commit_then_renew: bool,
+        origin: InternalString,
+        triggered_by: EventTriggerKind,
+    ) -> Result<(), LoroError> {
+        let oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        self._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            frontiers,
+            to_shrink_frontiers,
+            origin,
+            triggered_by,
+        )
+    }
+
+    /// Moves the state to `frontiers` using oplog and state borrows the caller
+    /// already holds.
+    ///
+    /// Taking the guards as arguments rather than acquiring them lets a caller
+    /// keep both locks across a sequence of moves, which is what makes a
+    /// there-and-back walk of history unobservable to other threads. It also
+    /// means this must never reach for either lock itself: doing so would
+    /// re-enter a mutex the calling thread already owns.
+    ///
+    /// The diff calculator lock is still taken here, and released before
+    /// returning, which keeps the group's acquisition order intact.
+    fn _checkout_without_emitting_with_guards(
+        &self,
+        oplog: &OpLog,
+        state: &mut DocState,
+        frontiers: &Frontiers,
+        to_shrink_frontiers: bool,
         origin: InternalString,
         triggered_by: EventTriggerKind,
     ) -> Result<(), LoroError> {
@@ -1733,20 +1804,19 @@ impl LoroDoc {
                     .into_boxed_str(),
             ));
         }
-        let from_frontiers = self.state_frontiers();
+        let from_frontiers = state.frontiers.clone();
         loro_common::info!(
             "checkout from={:?} to={:?} cur_vv={:?}",
             from_frontiers,
             frontiers,
-            self.oplog_vv()
+            oplog.vv()
         );
 
         if &from_frontiers == frontiers {
-            self.set_detached(frontiers != &self.oplog_frontiers());
+            self.set_detached(frontiers != oplog.frontiers());
             return Ok(());
         }
 
-        let oplog = self.oplog.lock();
         if oplog.dag.is_before_shallow_root(frontiers) {
             return Err(LoroError::SwitchToVersionBeforeShallowRoot);
         }
@@ -1761,7 +1831,6 @@ impl LoroDoc {
             return Ok(());
         }
 
-        let mut state = self.state.lock();
         let mut calc = self.diff_calculator.lock();
         for i in frontiers.iter() {
             if !oplog.dag.contains(i) {
@@ -1786,7 +1855,7 @@ impl LoroDoc {
 
         self.set_detached(true);
         let (diff, diff_mode) =
-            calc.calc_diff_internal(&oplog, &before, &state.frontiers, after, &frontiers, None);
+            calc.calc_diff_internal(oplog, &before, &state.frontiers, after, &frontiers, None);
         state.apply_diff(
             InternalDocDiff {
                 origin,

@@ -55,6 +55,34 @@ fn doc_with_two_commits() -> (LoroDoc, Frontiers, Frontiers) {
     (doc, earlier, resting)
 }
 
+/// A document with three commits, returning the two earliest versions and the
+/// resting one.
+///
+/// A rewind that walks between the two *earliest* versions ends its walk at the
+/// second, not at where the document rests — so restoring the document afterwards
+/// is a genuine move back to the third version, performed inside the locked
+/// window. A rewind whose endpoints straddle the resting version (as
+/// [`doc_with_two_commits`] produces) leaves the restore a no-op, and so cannot
+/// tell whether the restore is inside the window or outside it.
+fn doc_with_three_commits() -> (LoroDoc, Frontiers, Frontiers, Frontiers) {
+    let doc = LoroDoc::new();
+    doc.get_text("text").insert(0, "hello").unwrap();
+    doc.commit();
+    let first = doc.state_frontiers();
+
+    doc.get_text("text").insert(5, " world").unwrap();
+    doc.commit();
+    let second = doc.state_frontiers();
+
+    doc.get_text("text").insert(11, " again").unwrap();
+    doc.commit();
+    let resting = doc.state_frontiers();
+
+    assert_ne!(first, second);
+    assert_ne!(second, resting);
+    (doc, first, second, resting)
+}
+
 /// The outcome of one race: how many times the reader sampled the document, and
 /// every sample whose version was not the resting version.
 struct Observations {
@@ -89,21 +117,24 @@ impl Observations {
 
 /// Runs `rewind` repeatedly on one thread while another thread samples the
 /// document's version, and reports every sample that was not the resting one.
-fn race_reader_against<F>(rewind: F) -> Observations
+///
+/// The rewind closure captures whatever historical versions it operates on, so
+/// that this harness is agnostic to which operation is under test. `resting` is
+/// the version the document sits at throughout — the only version a reader may
+/// legitimately observe, since nothing writes to the document once the threads
+/// start.
+fn race_reader_against<F>(doc: LoroDoc, resting: Frontiers, rewind: F) -> Observations
 where
-    F: Fn(&LoroDoc, &Frontiers, &Frontiers) + Send + 'static,
+    F: Fn(&LoroDoc) + Send + 'static,
 {
-    let (doc, earlier, resting) = doc_with_two_commits();
     let rewinding_finished = Arc::new(AtomicBool::new(false));
 
     let rewinder = {
         let doc = doc.clone();
-        let earlier = earlier.clone();
-        let resting = resting.clone();
         let finished = rewinding_finished.clone();
         std::thread::spawn(move || {
             for _ in 0..REWINDS {
-                rewind(&doc, &earlier, &resting);
+                rewind(&doc);
             }
             finished.store(true, Ordering::SeqCst);
         })
@@ -138,8 +169,32 @@ where
 
 #[test]
 fn diff_never_exposes_an_intermediate_version_to_a_reader() {
-    let observations = race_reader_against(|doc, earlier, resting| {
-        doc.diff(earlier, resting).unwrap();
+    let (doc, earlier, resting) = doc_with_two_commits();
+    let a = earlier;
+    let b = resting.clone();
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.diff(&a, &b).unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("diff")
+    );
+}
+
+/// The discriminating case for the restore leg: `diff` walks between the two
+/// *earliest* versions while the document rests at a third, so returning it to
+/// rest is a real move performed inside the locked window. If that final move
+/// were made outside the locks — or omitted — a reader would observe the second
+/// version, which is not the resting one, and this test would fail where the
+/// straddling case above cannot.
+#[test]
+fn diff_between_two_historical_versions_never_exposes_the_restore_move() {
+    let (doc, first, second, resting) = doc_with_three_commits();
+    let a = first;
+    let b = second;
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.diff(&a, &b).unwrap();
     });
     assert!(
         observations.violations.is_empty(),
@@ -150,8 +205,10 @@ fn diff_never_exposes_an_intermediate_version_to_a_reader() {
 
 #[test]
 fn fork_at_never_exposes_an_intermediate_version_to_a_reader() {
-    let observations = race_reader_against(|doc, earlier, _resting| {
-        doc.fork_at(earlier).unwrap();
+    let (doc, earlier, resting) = doc_with_two_commits();
+    let a = earlier;
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.fork_at(&a).unwrap();
     });
     assert!(
         observations.violations.is_empty(),
