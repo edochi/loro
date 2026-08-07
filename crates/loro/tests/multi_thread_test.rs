@@ -224,6 +224,84 @@ mod loom_test {
         });
     }
 
+    /// A reader on another thread must never observe a version that the
+    /// document is only passing through while `diff` walks its history.
+    ///
+    /// The oracle is deliberately the version and not the text. `diff` parks
+    /// the document at an older version whose text is content-identical to text
+    /// the document legitimately holds at some resting point, so a length or
+    /// content assertion here would be satisfied whether or not the reader
+    /// raced the rewind. Nothing writes to the document once the threads start,
+    /// so there is exactly one legitimate resting version — the frontier left
+    /// by the last commit — and any other observed frontier came from inside
+    /// the rewind window.
+    #[test]
+    fn diff_never_exposes_an_intermediate_version_to_a_reader() {
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 5000;
+        builder.check(|| {
+            let doc = LoroDoc::new();
+            doc.get_text("text").insert(0, "a").unwrap();
+            doc.commit();
+            let earlier = doc.state_frontiers();
+            doc.get_text("text").insert(1, "b").unwrap();
+            doc.commit();
+            let resting = doc.state_frontiers();
+
+            let doc1 = doc.clone();
+            let doc2 = doc.clone();
+            let a = earlier.clone();
+            let b = resting.clone();
+
+            let h0 = loom::thread::spawn(move || {
+                doc1.diff(&a, &b).unwrap();
+            });
+            let h1 = loom::thread::spawn(move || doc2.state_frontiers());
+
+            h0.join().unwrap();
+            let observed = h1.join().unwrap();
+            assert_eq!(
+                observed, resting,
+                "reader saw a version the document only passes through while `diff` ran"
+            );
+        });
+    }
+
+    /// The same guarantee for `fork_at`, which reaches its answer the same way:
+    /// by moving the live document back to the requested version, reading it,
+    /// and moving it forward again. See the sibling `diff` test for why the
+    /// observed version, rather than the text, is the only oracle that can fail.
+    #[test]
+    fn fork_at_never_exposes_an_intermediate_version_to_a_reader() {
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 5000;
+        builder.check(|| {
+            let doc = LoroDoc::new();
+            doc.get_text("text").insert(0, "a").unwrap();
+            doc.commit();
+            let earlier = doc.state_frontiers();
+            doc.get_text("text").insert(1, "b").unwrap();
+            doc.commit();
+            let resting = doc.state_frontiers();
+
+            let doc1 = doc.clone();
+            let doc2 = doc.clone();
+            let a = earlier.clone();
+
+            let h0 = loom::thread::spawn(move || {
+                doc1.fork_at(&a).unwrap();
+            });
+            let h1 = loom::thread::spawn(move || doc2.state_frontiers());
+
+            h0.join().unwrap();
+            let observed = h1.join().unwrap();
+            assert_eq!(
+                observed, resting,
+                "reader saw a version the document only passes through while `fork_at` ran"
+            );
+        });
+    }
+
     #[test]
     fn concurrently_import_export() {
         let mut builder = loom::model::Builder::new();
