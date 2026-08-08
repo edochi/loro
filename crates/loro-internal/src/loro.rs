@@ -1854,7 +1854,7 @@ impl LoroDoc {
     ///
     /// The diff calculator lock is still taken here, and released before
     /// returning, which keeps the group's acquisition order intact.
-    fn _checkout_without_emitting_with_guards(
+    pub(crate) fn _checkout_without_emitting_with_guards(
         &self,
         oplog: &OpLog,
         state: &mut DocState,

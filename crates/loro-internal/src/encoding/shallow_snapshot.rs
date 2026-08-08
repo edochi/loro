@@ -8,6 +8,7 @@ use crate::{
     container::{idx::ContainerIdx, list::list_op::InnerListOp},
     dag::DagUtils,
     encoding::fast_snapshot::{_encode_snapshot, Snapshot},
+    event::EventTriggerKind,
     state::{container_store::FRONTIERS_KEY, DocState},
     version::{Frontiers, VersionVector},
     LoroDoc,
@@ -131,11 +132,27 @@ pub(crate) fn export_shallow_snapshot_inner(
             ));
         }
     }
-    drop(oplog);
+    // Hold the oplog and state locks across the rewind, the whole encode, and the
+    // restore, so the live document is never observable while it sits at a
+    // historical version. Each move on its own parks the state at a version the
+    // document never rests at; a reader that took the state lock between the
+    // rewind and the restore would otherwise be answered with a version that was
+    // never true. Holding both locks for the whole there-and-back walk makes such
+    // a reader wait instead. The oplog guard is already held above; the state
+    // guard is taken here, after the fast paths that only read current state have
+    // been ruled out. Acquisition order is the group's fixed one: transaction
+    // (already held — export runs inside `with_barrier`), then oplog, then state.
+    let mut state = doc.app_state().lock();
     let result = (|| -> Result<Snapshot, LoroEncodeError> {
-        doc._checkout_without_emitting(&start_from, false, false)
-            .map_err(LoroEncodeError::from)?;
-        let mut state = doc.app_state().lock();
+        doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &start_from,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
         let alive_containers = state.ensure_all_alive_containers()?;
         if has_unknown_container(alive_containers.iter().copied()) {
             return Err(LoroEncodeError::UnknownContainer);
@@ -143,11 +160,16 @@ pub(crate) fn export_shallow_snapshot_inner(
         let mut alive_c_bytes = alive_indices_to_bytes(&state, &alive_containers);
         state.store.flush();
         let shallow_root_state_kv = state.store.get_kv_clone();
-        drop(state);
-        doc._checkout_without_emitting(&latest_frontiers, false, false)
-            .map_err(LoroEncodeError::from)?;
+        doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &latest_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
         let state_bytes = if ops_num > MAX_OPS_NUM_TO_ENCODE_WITHOUT_LATEST_STATE {
-            let mut state = doc.app_state().lock();
             state.ensure_all_alive_containers()?;
             state.store.encode();
             // All the containers that are created after start_from need to be encoded
@@ -181,8 +203,14 @@ pub(crate) fn export_shallow_snapshot_inner(
         })
     })();
 
-    restore_export_doc_state(doc, &state_frontiers, is_attached)?;
-    doc.drop_pending_events();
+    // Restore always runs, then the encode error, if any, is surfaced. The
+    // restoring move stays under the held guards, and the events the walk
+    // recorded are cleared against that same guard — reaching for the state lock
+    // through `doc` here would deadlock the thread that already holds it.
+    restore_export_doc_state(doc, &oplog, &mut state, &state_frontiers, is_attached)?;
+    state.take_events();
+    drop(state);
+    drop(oplog);
     Ok((result?, start_from))
 }
 
@@ -217,13 +245,27 @@ pub(crate) fn export_state_only_snapshot<W: std::io::Write>(
     let to_vv = frontiers_to_vv_for_export(&oplog, target_frontiers, "export_state_only_snapshot")?;
     let oplog_bytes =
         oplog.export_change_store_in_range(&start_vv, &start_from, &to_vv, target_frontiers);
-    let state_frontiers = doc.state_frontiers();
     let is_attached = !doc.is_detached();
-    drop(oplog);
+    // Hold the oplog and state locks across the rewind, the whole encode, and the
+    // restore, so the live document is never observable while it sits at a
+    // historical version. Each move on its own parks the state at a version the
+    // document never rests at; a reader that took the state lock between two of
+    // them would otherwise be answered with a version that was never true.
+    // Holding both locks for the whole there-and-back walk makes such a reader
+    // wait instead. Acquisition order is the group's fixed one: transaction
+    // (already held — export runs inside `with_barrier`), then oplog, then state.
+    let mut state = doc.app_state().lock();
+    let state_frontiers = state.frontiers.clone();
     let result = (|| -> Result<(), LoroEncodeError> {
-        doc._checkout_without_emitting(&start_from, false, false)
-            .map_err(LoroEncodeError::from)?;
-        let mut state = doc.app_state().lock();
+        doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &start_from,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
         let alive_containers = state.ensure_all_alive_containers()?;
         if has_unknown_container(alive_containers.iter().copied()) {
             return Err(LoroEncodeError::UnknownContainer);
@@ -231,11 +273,16 @@ pub(crate) fn export_state_only_snapshot<W: std::io::Write>(
         let mut alive_c_bytes = alive_indices_to_bytes(&state, &alive_containers);
         state.store.flush();
         let shallow_state_kv = state.store.get_kv_clone();
-        drop(state);
 
-        doc._checkout_without_emitting(target_frontiers, false, false)
-            .map_err(LoroEncodeError::from)?;
-        let mut state = doc.app_state().lock();
+        doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            target_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
         state.ensure_all_alive_containers()?;
         state.store.encode();
         for cid in state.store.iter_all_container_ids() {
@@ -250,7 +297,6 @@ pub(crate) fn export_state_only_snapshot<W: std::io::Write>(
         }
 
         let target_state_kv = state.store.get_kv_clone();
-        drop(state);
         target_state_kv.remove_same(&shallow_state_kv);
         target_state_kv.retain_keys(&alive_c_bytes);
 
@@ -266,8 +312,14 @@ pub(crate) fn export_state_only_snapshot<W: std::io::Write>(
         Ok(())
     })();
 
-    restore_export_doc_state(doc, &state_frontiers, is_attached)?;
-    doc.drop_pending_events();
+    // Restore always runs, then the encode error, if any, is surfaced. The
+    // restoring move stays under the held guards, and the events the walk
+    // recorded are cleared against that same guard — reaching for the state lock
+    // through `doc` here would deadlock the thread that already holds it.
+    restore_export_doc_state(doc, &oplog, &mut state, &state_frontiers, is_attached)?;
+    state.take_events();
+    drop(state);
+    drop(oplog);
     result?;
     Ok(start_from)
 }
@@ -296,12 +348,25 @@ fn frontiers_to_vv_for_export(
 
 fn restore_export_doc_state(
     doc: &LoroDoc,
+    oplog: &crate::OpLog,
+    state: &mut DocState,
     state_frontiers: &Frontiers,
     was_attached: bool,
 ) -> Result<(), LoroEncodeError> {
-    if &doc.state_frontiers() != state_frontiers {
-        doc._checkout_without_emitting(state_frontiers, false, false)
-            .map_err(LoroEncodeError::from)?;
+    // Restore under the oplog and state guards the caller already holds, so the
+    // move back to where the document rested is as unobservable as the rest of
+    // the walk. Reaching for either lock here would deadlock the calling thread,
+    // which owns them both.
+    if &state.frontiers != state_frontiers {
+        doc._checkout_without_emitting_with_guards(
+            oplog,
+            state,
+            state_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
     }
 
     if was_attached {
@@ -390,12 +455,32 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
     w: &mut W,
 ) -> Result<(), LoroEncodeError> {
     let was_detached = doc.is_detached();
-    let version_before_start = doc.state_frontiers().clone();
-    doc._checkout_without_emitting(frontiers, true, false)
-        .map_err(LoroEncodeError::from)?;
+
+    // Hold the oplog and state locks across the rewind, the whole encode, and the
+    // restore, so the live document is never observable while it sits at the
+    // requested historical version. Each move on its own parks the state at a
+    // version the document never rests at; a reader that took the state lock
+    // between the rewind and the restore would otherwise be answered with a
+    // version that was never true. Holding both locks for the whole there-and-back
+    // walk makes such a reader wait instead. Acquisition order is the group's
+    // fixed one: transaction (already held — export runs inside `with_barrier`),
+    // then oplog, then state.
+    let oplog = doc.oplog().lock();
+    let mut state = doc.app_state().lock();
+    let version_before_start = state.frontiers.clone();
+
     let result = 'block: {
-        let oplog = doc.oplog().lock();
-        let mut state = doc.app_state().lock();
+        if let Err(e) = doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            frontiers,
+            true,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        ) {
+            break 'block Err(LoroEncodeError::from(e));
+        }
+
         let is_shallow = state.store.shallow_root_store().is_some();
         if is_shallow {
             break 'block Err(LoroEncodeError::from(LoroError::NotImplemented(
@@ -449,13 +534,29 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
 
         Ok(())
     };
+    // Always restore the document to where it rested before the walk, still under
+    // the held locks so the restoring move is as unobservable as the rest of the
+    // walk. The encode error, if any, is surfaced after the restore has run.
     let restore_result = doc
-        ._checkout_without_emitting(&version_before_start, false, false)
+        ._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &version_before_start,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
         .map_err(LoroEncodeError::from);
     if !was_detached {
         doc.set_detached(false);
     }
-    doc.app_state().lock().take_events();
+    // Clear the events the walk recorded, exactly once, against the held guard.
+    // Because export runs under `with_barrier` the transaction is held for the
+    // whole function, so clearing the flag above is not exposed to the
+    // import-teardown race and needs no reordering around the transaction.
+    state.take_events();
+    drop(state);
+    drop(oplog);
 
     match result {
         Err(err) => Err(err),

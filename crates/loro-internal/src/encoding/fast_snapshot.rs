@@ -16,8 +16,8 @@
 use std::io::{Read, Write};
 
 use crate::{
-    change::Change, encoding::shallow_snapshot, oplog::ChangeStore, version::Frontiers, LoroDoc,
-    OpLog, VersionVector,
+    change::Change, encoding::shallow_snapshot, event::EventTriggerKind, oplog::ChangeStore,
+    version::Frontiers, LoroDoc, OpLog, VersionVector,
 };
 use bytes::{Buf, Bytes};
 use loro_common::{HasCounterSpan, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult};
@@ -285,7 +285,6 @@ impl OpLog {
 
 pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Result<Snapshot, LoroEncodeError> {
     assert!(doc.drop_pending_events().is_empty());
-    let old_state_frontiers = doc.state_frontiers();
     let was_detached = doc.is_detached();
     let oplog = doc.oplog().lock();
     let mut state = doc.app_state().lock();
@@ -299,6 +298,12 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Result<Snapshot, LoroEncod
         return Ok(snapshot);
     }
 
+    // Where the document rests, read from the held state guard before any move so
+    // the restore returns it to exactly this version. A detached document rests
+    // behind the latest version; an attached one rests at the latest and the walk
+    // below is skipped entirely.
+    let old_state_frontiers = state.frontiers.clone();
+
     assert!(!state.is_in_txn());
     let oplog_bytes = oplog.encode_change_store();
     if oplog.is_shallow() {
@@ -307,32 +312,61 @@ pub(crate) fn encode_snapshot_inner(doc: &LoroDoc) -> Result<Snapshot, LoroEncod
             state.store.shallow_root_frontiers().unwrap()
         );
     }
-    if was_detached {
-        let latest = oplog.frontiers().clone();
-        drop(state);
-        drop(oplog);
-        doc._checkout_without_emitting(&latest, false, true)
-            .unwrap();
-        state = doc.app_state().lock();
-    }
-    // Every container referenced by applied ops/diffs already has a store entry
-    // (`ensure_containers_created_by_op` / `ensure_containers_created_by_internal_diff`), so a
-    // full snapshot does not need to walk the alive-container graph: flushing the store and
-    // exporting the kv bytes is sufficient, and it keeps snapshot-backed state lazy. Only
-    // shallow snapshot export still derives the alive set (to filter retained keys).
-    let snapshot: Result<Snapshot, LoroEncodeError> = Ok(Snapshot {
-        oplog_bytes,
-        state_bytes: Some(state.store.encode()),
-        shallow_root_state_bytes: Bytes::new(),
-    });
-    if was_detached {
-        drop(state);
-        doc._checkout_without_emitting(&old_state_frontiers, false, true)
-            .unwrap();
-        doc.drop_pending_events();
-    }
 
-    snapshot
+    // A detached document rests behind the latest version, but a full snapshot
+    // records the state at the latest. Walk the live document forward to the
+    // latest, encode there, then walk it back to where it rested — all under the
+    // oplog and state guards already held, so the document is never observable at
+    // the latest, a version it does not rest at. Each move on its own would park
+    // the state at a version the document never rests at; holding both locks for
+    // the whole there-and-back walk makes a racing reader wait instead. Acquisition
+    // order is the group's fixed one: transaction (already held — export runs
+    // inside `with_barrier`), then oplog, then state.
+    let result = (|| -> Result<Snapshot, LoroEncodeError> {
+        if was_detached {
+            let latest = oplog.frontiers().clone();
+            doc._checkout_without_emitting_with_guards(
+                &oplog,
+                &mut state,
+                &latest,
+                false,
+                "checkout".into(),
+                EventTriggerKind::Checkout,
+            )
+            .map_err(LoroEncodeError::from)?;
+        }
+        // Every container referenced by applied ops/diffs already has a store entry
+        // (`ensure_containers_created_by_op` / `ensure_containers_created_by_internal_diff`), so a
+        // full snapshot does not need to walk the alive-container graph: flushing the store and
+        // exporting the kv bytes is sufficient, and it keeps snapshot-backed state lazy. Only
+        // shallow snapshot export still derives the alive set (to filter retained keys).
+        Ok(Snapshot {
+            oplog_bytes,
+            state_bytes: Some(state.store.encode()),
+            shallow_root_state_bytes: Bytes::new(),
+        })
+    })();
+
+    // The restore always runs, then the encode error, if any, is surfaced. The
+    // restoring move stays under the held guards, and the events the walk recorded
+    // are cleared against that same guard — reaching for the state lock through
+    // `doc` here would deadlock the thread that already holds it.
+    if was_detached {
+        doc._checkout_without_emitting_with_guards(
+            &oplog,
+            &mut state,
+            &old_state_frontiers,
+            false,
+            "checkout".into(),
+            EventTriggerKind::Checkout,
+        )
+        .map_err(LoroEncodeError::from)?;
+        state.take_events();
+    }
+    drop(state);
+    drop(oplog);
+
+    result
 }
 
 pub(crate) fn decode_oplog(oplog: &mut OpLog, bytes: &[u8]) -> Result<Vec<Change>, LoroError> {

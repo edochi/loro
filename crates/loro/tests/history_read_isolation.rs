@@ -28,7 +28,7 @@
 //! flakier.
 #![cfg(not(loom))]
 
-use loro::{ContainerID, Frontiers, LoroDoc, UndoManager, UndoScope};
+use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, UndoManager, UndoScope};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -218,6 +218,54 @@ fn fork_at_never_exposes_an_intermediate_version_to_a_reader() {
     );
 }
 
+/// Exporting a shallow snapshot that starts at an older frontier walks the live
+/// document back to that frontier, reads the trimmed state there, moves forward
+/// to the latest version, and restores. If it releases the state lock during the
+/// walk, a reader on another thread can observe the older frontier the export is
+/// only passing through.
+///
+/// The document rests at `resting` throughout — nothing writes to it once the
+/// threads start — so that is the only legitimate version and the oracle can be
+/// the version, never the text (the trimmed intermediate state is content-shaped
+/// like a resting one).
+#[test]
+fn shallow_snapshot_export_never_exposes_an_intermediate_version_to_a_reader() {
+    let (doc, earlier, resting) = doc_with_two_commits();
+    let start_from = earlier;
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.export(ExportMode::shallow_snapshot(&start_from))
+            .unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("export(ShallowSnapshot)")
+    );
+}
+
+/// Exporting a state-only snapshot at an older target walks the live document
+/// back to that target, encodes the state there, and restores to where the
+/// document rests. The walk back and the restore are both real moves off the
+/// resting version; if the state lock is released between them a reader can
+/// observe the older target version the export only passes through.
+///
+/// As above the oracle is the version: the document has one resting version for
+/// the whole test, so any other frontier a reader samples came from inside the
+/// walk.
+#[test]
+fn state_only_snapshot_export_never_exposes_an_intermediate_version_to_a_reader() {
+    let (doc, earlier, resting) = doc_with_two_commits();
+    let target = earlier;
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.export(ExportMode::state_only(Some(&target))).unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("export(StateOnly)")
+    );
+}
+
 /// How many committed edits to record as undo entries. Each one gives the
 /// undo below a separate span to walk history over, and so a separate window in
 /// which a racing reader could catch the document parked at an older version.
@@ -282,5 +330,49 @@ fn undo_never_exposes_an_intermediate_version_to_a_reader() {
         observations.violations.is_empty(),
         "{}",
         observations.report("undo")
+    );
+}
+
+/// Exporting a full snapshot of a *detached* document walks the live document
+/// forward from where it rests to the latest version, encodes the state there,
+/// and walks it back. A full snapshot must record the state at the latest, but a
+/// detached document rests behind it, so that forward-and-back walk is a real move
+/// off the resting version. If the state lock is released during the walk, a
+/// reader on another thread can observe the latest version, which is not where the
+/// detached document rests.
+///
+/// Unlike the other cases here the document must be detached, because the walk
+/// only happens for a detached document — an attached one already rests at the
+/// latest and the export encodes in place. The document rests at `earlier`
+/// throughout (nothing writes to it and it stays detached), so the oracle is the
+/// version, never the text: the state at the latest is content-shaped like any
+/// resting state.
+#[test]
+fn snapshot_export_of_a_detached_doc_never_exposes_the_latest_version_to_a_reader() {
+    let (doc, earlier, _resting) = doc_with_two_commits();
+    doc.set_detached_editing(true);
+    doc.checkout(&earlier).unwrap();
+
+    assert!(
+        doc.is_detached(),
+        "the fixture must be detached, or the export never enters the forward-walk path under test"
+    );
+    assert!(
+        !doc.is_shallow(),
+        "a plain document is not shallow, so the export takes the full-snapshot path, not the gc one"
+    );
+    assert_eq!(
+        doc.state_frontiers(),
+        earlier,
+        "the detached document must rest at the earlier version"
+    );
+
+    let observations = race_reader_against(doc, earlier, move |doc| {
+        doc.export(ExportMode::Snapshot).unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("export(Snapshot)")
     );
 }
