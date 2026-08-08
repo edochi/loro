@@ -376,3 +376,143 @@ fn snapshot_export_of_a_detached_doc_never_exposes_the_latest_version_to_a_reade
         observations.report("export(Snapshot)")
     );
 }
+
+/// Exporting a shallow snapshot from a *detached* document that rests behind the
+/// latest version makes the export's restore leg a real move. The export walks the
+/// live document back to the requested start frontier, forward to the latest
+/// version, encodes, and restores to where the document rests. When the document
+/// rests at the latest (attached) that restore moves nothing, so a straddling
+/// fixture cannot tell whether the restore is inside the locked window or outside
+/// it. A detached document resting at an earlier version forces the restore to move
+/// the live document off the latest version back to where it rested — the move this
+/// test arms.
+///
+/// The fast paths that avoid the walk are only taken when the document already
+/// rests at the latest version, so a detached document resting behind it skips them
+/// and takes the slow rewinding path. The oracle is the version: the document rests,
+/// detached, at `earlier` for the whole test, so any other frontier a reader samples
+/// came from inside the walk. The trimmed intermediate state is content-shaped like a
+/// resting one, so only the version discriminates.
+#[test]
+fn shallow_snapshot_export_of_a_detached_doc_never_exposes_the_restore_move() {
+    let (doc, start, earlier, head) = doc_with_three_commits();
+    doc.set_detached_editing(true);
+    doc.checkout(&earlier).unwrap();
+
+    assert!(
+        doc.is_detached(),
+        "the fixture must be detached, or the export never takes the rewinding path under test"
+    );
+    assert!(
+        !doc.is_shallow(),
+        "a plain document is not shallow, so the export takes the full walk, not a fast root path"
+    );
+    assert_eq!(
+        doc.state_frontiers(),
+        earlier,
+        "the detached document must rest at the earlier version"
+    );
+    assert_ne!(
+        earlier, head,
+        "the resting version must sit behind the latest, or the restore leg moves nothing"
+    );
+    println!(
+        "shallow-snapshot detached fixture: resting(earlier)={:?} latest(head)={:?} start={:?}",
+        earlier, head, start
+    );
+
+    let observations = race_reader_against(doc, earlier, move |doc| {
+        doc.export(ExportMode::ShallowSnapshot(std::borrow::Cow::Owned(
+            start.clone(),
+        )))
+        .unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("export(ShallowSnapshot) detached")
+    );
+}
+
+/// Exporting a state-only snapshot at a two-element *merge* frontier makes both the
+/// export's second checkout and its restore real moves. Computing the shallow start
+/// reduces a merge target to its single common ancestor, so the export walks the
+/// live document back to that ancestor, forward to the merge frontier (the second
+/// checkout), encodes, and restores to where the document rests. With linear
+/// single-peer history the ancestor equals the target and that second checkout moves
+/// nothing; a genuine two-way concurrent merge separates them, and resting the
+/// document at a version ahead of the merge makes the restore a move as well.
+///
+/// The oracle is the version: the document rests at `head` for the whole test, so any
+/// other frontier a reader samples — the common ancestor or the merge itself — came
+/// from inside the walk.
+#[test]
+fn state_only_export_at_a_merge_frontier_never_exposes_the_intermediate_moves() {
+    // Two peers with distinct ids share a base, edit concurrently from it, then
+    // merge — producing a frontier with two elements.
+    let doc_a = LoroDoc::new();
+    doc_a.set_peer_id(1).unwrap();
+    let doc_b = LoroDoc::new();
+    doc_b.set_peer_id(2).unwrap();
+
+    doc_a.get_text("text").insert(0, "base").unwrap();
+    doc_a.commit();
+    let base = doc_a.state_frontiers();
+    // Share the base as a real common prefix.
+    doc_b
+        .import(&doc_a.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+
+    // Concurrent edits: neither peer has seen the other's.
+    doc_a.get_text("text").insert(4, "A").unwrap();
+    doc_a.commit();
+    doc_b.get_text("text").insert(4, "B").unwrap();
+    doc_b.commit();
+
+    // Merge peer B's branch into peer A: the frontier now has both branch heads.
+    doc_a
+        .import(&doc_b.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let merge = doc_a.state_frontiers();
+
+    // One more commit, so the latest version sits ahead of the merge as a single
+    // element and the document rests there, attached.
+    doc_a.get_text("text").insert(0, "Z").unwrap();
+    doc_a.commit();
+    let head = doc_a.state_frontiers();
+
+    assert_eq!(
+        merge.len(),
+        2,
+        "the merge must be a genuine two-way concurrent merge, or the second checkout moves nothing"
+    );
+    assert_eq!(
+        base.len(),
+        1,
+        "the shared base is a single-element frontier, the common ancestor the export walks back to"
+    );
+    assert_ne!(
+        base, merge,
+        "the common ancestor must differ from the merge target, or the second checkout moves nothing"
+    );
+    assert_ne!(
+        merge, head,
+        "the latest version must sit ahead of the merge, or the restore leg moves nothing"
+    );
+    println!(
+        "state-only merge fixture: base(ancestor)={:?} merge(target)={:?} resting(head)={:?}",
+        base, merge, head
+    );
+
+    let observations = race_reader_against(doc_a, head, move |doc| {
+        doc.export(ExportMode::StateOnly(Some(std::borrow::Cow::Owned(
+            merge.clone(),
+        ))))
+        .unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("export(StateOnly) merge")
+    );
+}
