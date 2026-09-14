@@ -1928,7 +1928,13 @@ impl DocState {
             let id = self.arena.idx_to_id(idx).unwrap();
             if let Some(parent_idx) = self.arena.get_parent(idx) {
                 let Some(prop) = self.get_logical_child_index(parent_idx, &id) else {
-                    tracing::warn!("Missing in parent's children");
+                    tracing::info!(
+                        id = %id,
+                        "Missing in parent's children - container is under a deleted node or was overwritten"
+                    );
+                    ensure_cov::notify_cov(
+                        "loro_internal::state::DocState::get_path::missing_in_parent",
+                    );
                     return None;
                 };
                 ans.push((id, prop));
