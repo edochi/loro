@@ -15,7 +15,7 @@ use crate::{
 };
 use append_only_bytes::BytesSlice;
 use loro_common::PeerID;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 use std::{
     num::NonZeroU16,
@@ -43,6 +43,20 @@ struct ArenaContainers {
     /// `get_deep_value`, jsonpath, ...). Keeping it pre-filtered means those paths do
     /// not pay a per-mergeable `is_mergeable()` parse on every call.
     top_level_root_c_idx: Vec<ContainerIdx>,
+    /// Containers seen to have carried a style op in some DECODED change.
+    ///
+    /// Recorded where ops are registered, so it costs one check per op on a path
+    /// that already visits every op, and answers in O(1) afterwards. Membership is
+    /// monotonic within an import -- a style op that existed once has already
+    /// displaced the entity positions any reader of that container's history would
+    /// report, so it is never cleared for a container whose styles are later
+    /// removed -- but a rolled-back import restores the whole set, since an import
+    /// can set the fact for a container that existed long before it.
+    ///
+    /// Absence means "not seen", not "does not exist": changes that arrived in a
+    /// snapshot are decoded only when read, and a shallow document's trimmed
+    /// changes are absent altogether.
+    styled: FxHashSet<ContainerIdx>,
     /// Optional resolver used when querying parent for a container that has not been registered yet.
     /// If set, `get_parent` will try this resolver to lazily fetch and register the parent.
     ///
@@ -84,6 +98,14 @@ pub(crate) struct SharedArenaRollback {
     top_level_root_len: usize,
     values_len: usize,
     str: StrArenaCheckpoint,
+    /// The whole styled set, not a length.
+    ///
+    /// Everything else here rolls back by truncating to a length, because it only
+    /// ever grows at the end. The styled set does not: an import can set the fact
+    /// for a container that already existed, and truncating by index leaves that
+    /// set. Keeping a copy is cheap -- the set is empty for the documents that
+    /// never use styles, and holds one entry per styled container otherwise.
+    styled: FxHashSet<ContainerIdx>,
 }
 
 #[derive(Debug)]
@@ -266,6 +288,7 @@ impl SharedArena {
                         parents: containers.parents.clone(),
                         root_c_idx: containers.root_c_idx.clone(),
                         top_level_root_c_idx: containers.top_level_root_c_idx.clone(),
+                        styled: containers.styled.clone(),
                         parent_resolver: containers.parent_resolver.clone(),
                     }
                 }),
@@ -280,6 +303,7 @@ impl SharedArena {
         let container_len = containers.container_idx_to_id.len();
         let root_len = containers.root_c_idx.len();
         let top_level_root_len = containers.top_level_root_c_idx.len();
+        let styled = containers.styled.clone();
         drop(containers);
         let values_len = self.inner.values.lock().len();
         let str = self.inner.str.lock().checkpoint();
@@ -289,6 +313,7 @@ impl SharedArena {
             top_level_root_len,
             values_len,
             str,
+            styled,
         }
     }
 
@@ -305,6 +330,7 @@ impl SharedArena {
         containers
             .top_level_root_c_idx
             .truncate(checkpoint.top_level_root_len);
+        containers.styled = checkpoint.styled;
         containers.parents.retain(|child, parent| {
             let child_is_kept = (child.to_index() as usize) < checkpoint.container_len;
             let parent_is_kept = parent
@@ -353,6 +379,25 @@ impl SharedArena {
             .container_id_to_idx
             .get(id)
             .copied()
+    }
+
+    /// Record that a container has carried a style op.
+    ///
+    /// See [`ArenaContainers::styled`]: the fact is monotonic within an import and
+    /// deliberately conservative.
+    pub(crate) fn mark_container_styled(&self, idx: ContainerIdx) {
+        self.inner.containers.write().styled.insert(idx);
+    }
+
+    /// Whether a style op has been recorded for this container.
+    ///
+    /// Precisely: whether a style op appears in some change THIS DOCUMENT HAS
+    /// DECODED. Changes written locally and changes arriving as updates are always
+    /// decoded; changes arriving in a snapshot are decoded only when something
+    /// reads them, and a shallow document's trimmed changes are gone entirely. So
+    /// `false` means "none seen", not "none exists".
+    pub(crate) fn is_container_styled(&self, idx: ContainerIdx) -> bool {
+        self.inner.containers.read().styled.contains(&idx)
     }
 
     #[inline]

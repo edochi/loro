@@ -710,6 +710,13 @@ impl OpLog {
         self.change_store.change_num()
     }
 
+    /// How many change blocks are currently parsed in memory. See
+    /// [`ChangeStore::parsed_block_num`]: this counts what has been decoded, not
+    /// what the document stores, and loads nothing to answer.
+    pub fn parsed_change_block_num(&self) -> usize {
+        self.change_store.parsed_block_num()
+    }
+
     pub fn diagnose_size(&self) -> SizeInfo {
         let mut total_changes = 0;
         let mut total_ops = 0;

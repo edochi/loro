@@ -147,6 +147,11 @@ impl LoroDoc {
     ///
     /// When called in detached mode, it will fork at the current state frontiers.
     /// It will have the same effect as `fork_at(&self.state_frontiers())`.
+    ///
+    /// The new document is built from a snapshot, so it begins having decoded none
+    /// of its history. Facts this document recorded while decoding changes do not
+    /// carry over: see [`LoroDoc::diff_text_container`], whose refusal of styled
+    /// containers is one such fact.
     #[inline]
     pub fn fork(&self) -> Self {
         let doc = self.doc.fork();
@@ -156,6 +161,10 @@ impl LoroDoc {
     /// Fork the document at the given frontiers.
     ///
     /// The created doc will only contain the history before the specified frontiers.
+    ///
+    /// Like [`LoroDoc::fork`], the new document is built from a snapshot and so
+    /// begins having decoded none of its history; facts recorded while decoding
+    /// changes do not carry over.
     pub fn fork_at(&self, frontiers: &Frontiers) -> LoroResult<LoroDoc> {
         let new_doc = self.doc.fork_at(frontiers)?;
         new_doc.start_auto_commit();
@@ -926,6 +935,17 @@ impl LoroDoc {
         self.doc.len_changes()
     }
 
+    /// How many change blocks this document currently holds parsed in memory.
+    ///
+    /// Diagnostics. History written locally is parsed as it is written; history
+    /// that arrived in a snapshot stays encoded until something reads it, so a
+    /// freshly restored document reports zero however long its history is. Asking
+    /// loads nothing, unlike [`LoroDoc::len_changes`], which parses every block in
+    /// order to count.
+    pub fn parsed_change_block_len(&self) -> usize {
+        self.doc.parsed_change_block_len()
+    }
+
     /// Get the shallow value of the document.
     #[inline]
     pub fn get_value(&self) -> LoroValue {
@@ -1553,6 +1573,96 @@ impl LoroDoc {
     #[inline]
     pub fn diff(&self, a: &Frontiers, b: &Frontiers) -> LoroResult<DiffBatch> {
         self.doc.diff(a, b).map(|x| x.into())
+    }
+
+    /// Whether any committed op on the given container lies between two versions.
+    ///
+    /// Reads the oplog over the symmetric difference of the two versions and
+    /// stops at the first op belonging to the container, so the cost follows the
+    /// number of ops in that window rather than the size of the document. Unlike
+    /// [`LoroDoc::diff`] the document's version is never read or moved: no
+    /// checkout, no detached mode, no event.
+    ///
+    /// Only history the oplog has recorded is visible, and reading never flushes:
+    /// the document's pending edits keep their events, unlike [`LoroDoc::diff`],
+    /// which force-commits them before it can move the document.
+    ///
+    /// # Errors
+    ///
+    /// A frontier this document does not hold, or one older than a shallow
+    /// document's root; a container id that is not a text container, since this
+    /// is the pair of [`LoroDoc::diff_text_container`] and shares its scope; a
+    /// container id that exists nowhere in the document. A root container always
+    /// exists, and one with no ops in the window simply reports `false`.
+    pub fn container_changed_between(
+        &self,
+        cid: &ContainerID,
+        a: &Frontiers,
+        b: &Frontiers,
+    ) -> LoroResult<bool> {
+        self.doc.container_changed_between(cid, a, b)
+    }
+
+    /// The text deltas that carry one text container from version `a` to version
+    /// `b`.
+    ///
+    /// Applying the returned deltas to the container's text at `a` yields its
+    /// text at `b`. The delta is computed from the oplog alone, restricted to this
+    /// one container, so the document's version is never read or moved: no
+    /// checkout, no detached mode, no event.
+    ///
+    /// Only history the oplog has recorded is visible, and reading never flushes:
+    /// the document's pending edits keep their events, unlike [`LoroDoc::diff`],
+    /// which force-commits them before it can move the document.
+    ///
+    /// A container with no ops in the window yields an empty vector.
+    ///
+    /// # Units
+    ///
+    /// Retain and delete lengths count **unicode code points on every build**,
+    /// because they come from the raw richtext delta whose text chunks measure
+    /// themselves in unicode. On a normal build that is exactly what
+    /// [`LoroText::apply_delta`] expects, so the deltas can be handed straight
+    /// back to it. Under the `wasm` feature `apply_delta` switches to UTF-16 event
+    /// units while these deltas do not, so the two disagree wherever the text
+    /// holds a character outside the basic multilingual plane. This reader is not
+    /// for wasm consumers.
+    ///
+    /// # Errors
+    ///
+    /// Styled text is unsupported: a container with any style in its history is
+    /// refused. The refusal covers the whole history rather than just the window,
+    /// because the raw delta counts entity positions, which style anchors occupy,
+    /// so even a style created long before `a` and merely retained across the
+    /// window would silently shift every length.
+    ///
+    /// It reads a per-container fact recorded as changes are registered, which means
+    /// exactly "a style op in some change this document has decoded". Every local
+    /// edit and every imported update is decoded, so for those it means "ever".
+    /// History that arrives in a snapshot is decoded only when read, so a style op
+    /// in a block the document has never read is not known and such a container is
+    /// answered rather than refused; [`LoroDoc::fork`] and [`LoroDoc::fork_at`]
+    /// produce exactly such a document, and a shallow document cannot know about a
+    /// style before its root at all.
+    ///
+    /// # Cost
+    ///
+    /// The window's own ops, plus one lookup -- except for a window the calculator
+    /// cannot serve linearly, such as one whose ops are concurrent with `a`. For
+    /// those it rebuilds the container's tracker from that container's full
+    /// history, which is container-scoped rather than window-proportional: a
+    /// two-op window on a container with a long history costs the history.
+    ///
+    /// Also errors on a frontier this document does not hold, on a container id
+    /// that is not a text container, and on one that exists nowhere in the
+    /// document.
+    pub fn diff_text_container(
+        &self,
+        cid: &ContainerID,
+        a: &Frontiers,
+        b: &Frontiers,
+    ) -> LoroResult<Vec<TextDelta>> {
+        self.doc.diff_text_container(cid, a, b)
     }
 
     /// Check if the doc contains the target container.

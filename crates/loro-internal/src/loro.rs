@@ -9,7 +9,9 @@ use crate::{
     change::{Change, Timestamp},
     configure::{Configure, DefaultRandom, SecureRandomGenerator, StyleConfig},
     container::{
-        idx::ContainerIdx, list::list_op::InnerListOp, richtext::config::StyleConfigMap,
+        idx::ContainerIdx,
+        list::list_op::InnerListOp,
+        richtext::{config::StyleConfigMap, richtext_state::RichtextStateChunk},
         IntoContainerId,
     },
     cursor::{AbsolutePosition, CannotFindRelativePosition, Cursor, PosQueryResult},
@@ -22,8 +24,8 @@ use crate::{
         json_schema::{encode_change_to_json, json::JsonSchema},
         parse_header_and_body, EncodeMode, ImportBlobMetadata, ImportStatus, ParsedHeaderAndBody,
     },
-    event::{str_to_path, EventTriggerKind, Index, InternalDocDiff},
-    handler::{Handler, MovableListHandler, TextHandler, TreeHandler, ValueOrHandler},
+    event::{str_to_path, EventTriggerKind, Index, InternalDiff, InternalDocDiff},
+    handler::{Handler, MovableListHandler, TextDelta, TextHandler, TreeHandler, ValueOrHandler},
     id::PeerID,
     json::JsonChange,
     op::InnerContent,
@@ -1450,6 +1452,326 @@ impl LoroDoc {
         result.map(DiffBatch::new)
     }
 
+    /// Whether any committed op on `cid` lies between the two versions.
+    ///
+    /// Answers the containment question that [`Self::diff`] answers only as a
+    /// side effect of computing every container's delta: it reads the oplog's
+    /// changes over the symmetric difference of the two versions and stops at the
+    /// first op belonging to `cid`. Nothing is transformed and no delta is built,
+    /// so the cost is proportional to the number of ops in the window rather than
+    /// to the size of the document.
+    ///
+    /// The document's version is never consulted or moved: no checkout, no
+    /// transaction, no event. The oplog lock is held throughout; the state lock is
+    /// taken only to resolve a container the arena has not registered yet, and
+    /// only to read whether it exists.
+    ///
+    /// Because only the oplog is read, this sees **recorded history only**, and
+    /// reading never flushes: the document's pending edits keep their events, and
+    /// an op that has not yet reached the oplog is invisible.
+    ///
+    /// Paired with [`Self::diff_text_container`], and restricted to the same
+    /// container type: a non-text `cid` is an error rather than an answer.
+    ///
+    /// # Errors
+    ///
+    /// A frontier the dag does not hold, or one older than a shallow document's
+    /// root; a `cid` that is not a text container; a `cid` that exists nowhere in
+    /// the document.
+    pub fn container_changed_between(
+        &self,
+        cid: &ContainerID,
+        a: &Frontiers,
+        b: &Frontiers,
+    ) -> LoroResult<bool> {
+        Self::require_text_container(cid)?;
+        let oplog = self.oplog.lock();
+        Self::validate_frontiers_for_history_read(&oplog, a)?;
+        Self::validate_frontiers_for_history_read(&oplog, b)?;
+        let idx = self.resolve_container_for_history_read(&oplog, cid)?;
+        let (vv_a, vv_b) = Self::history_read_version_vectors(&oplog, a, b)?;
+
+        let (retreat, forward) = vv_a.diff_iter(&vv_b);
+        Ok(Self::any_op_on_container(
+            &oplog,
+            idx,
+            retreat.chain(forward),
+            |_| true,
+        ))
+    }
+
+    /// The text deltas that carry one text container from version `a` to version
+    /// `b`.
+    ///
+    /// Applying the returned deltas to the container's text at `a` yields its
+    /// text at `b`.
+    ///
+    /// Unlike [`Self::diff`], which walks the live document to `a`, records the
+    /// events of walking it to `b`, and walks it back, this computes the delta
+    /// from the oplog alone with a throwaway diff calculator restricted to the one
+    /// container. The document's version is never read or moved: no checkout, no
+    /// transaction, no event. The one mutation the calculation can make is
+    /// registering a container in the shared arena when the window creates it,
+    /// which is the same registration an import performs and is invisible to the
+    /// document's version.
+    ///
+    /// Because only the oplog is read, this sees **recorded history only**, and
+    /// reading never flushes: the document's pending edits keep their events, and
+    /// an op that has not yet reached the oplog is invisible.
+    ///
+    /// # Units
+    ///
+    /// Retain and delete lengths count **unicode code points on every build**,
+    /// because they come from the raw richtext delta, whose lengths are entity
+    /// lengths and whose text chunks measure themselves in unicode. On a normal
+    /// build that is what [`crate::handler::TextHandler`] positions use, so the
+    /// deltas can be fed straight back to it. Under the `wasm` feature the handler
+    /// switches to UTF-16 event units while these deltas do not, so the two
+    /// disagree wherever the text holds a character outside the basic multilingual
+    /// plane. This reader is not for wasm consumers.
+    ///
+    /// # Errors
+    ///
+    /// Styled text is not supported: a container with any style in its history is
+    /// refused with [`LoroError::NotImplemented`]. The refusal covers the whole
+    /// history rather than just the window, because the raw delta counts entity
+    /// positions, which style anchors occupy, so even a style created long before
+    /// `a` and merely retained across the window would silently shift every length.
+    ///
+    /// The refusal reads a fact recorded per container where changes are
+    /// registered, so it costs a lookup rather than a walk. It is exactly "a style
+    /// op in some change this document has decoded". Every local commit and every
+    /// imported update is decoded, so for those it means "ever". A snapshot is not:
+    /// its history arrives as stored blocks decoded only when read, so a style op
+    /// in a block the document has never read is not known, and such a container is
+    /// answered where it should be refused. A document produced by `fork` or
+    /// `fork_at` is built from a snapshot and so starts having decoded nothing. A
+    /// shallow document cannot know about a style before its root at all, since
+    /// those changes are not merely undecoded but absent. Closing the snapshot case
+    /// exactly requires either decoding every block at import, which gives up the
+    /// lazy history loading snapshots exist for, or carrying the fact in the
+    /// snapshot encoding; neither closes the shallow case. The gap is pinned by an
+    /// ignored test alongside the others.
+    ///
+    /// # Cost
+    ///
+    /// The window's own ops, plus one lookup. The exception is a window the
+    /// calculator cannot serve linearly -- one whose ops are concurrent with `a`,
+    /// or whose replay has to start from an older common ancestor -- for which it
+    /// rebuilds the container's tracker from that container's full history. That
+    /// rebuild is container-scoped rather than window-proportional, so a window of
+    /// two ops on a container with a long history costs the history, not the two
+    /// ops.
+    ///
+    /// Also errors on a frontier the dag does not hold, on a `cid` that is not a
+    /// text container, and on a `cid` that exists nowhere in the document.
+    pub fn diff_text_container(
+        &self,
+        cid: &ContainerID,
+        a: &Frontiers,
+        b: &Frontiers,
+    ) -> LoroResult<Vec<TextDelta>> {
+        Self::require_text_container(cid)?;
+        let oplog = self.oplog.lock();
+        Self::validate_frontiers_for_history_read(&oplog, a)?;
+        Self::validate_frontiers_for_history_read(&oplog, b)?;
+        let idx = self.resolve_container_for_history_read(&oplog, cid)?;
+        let (vv_a, vv_b) = Self::history_read_version_vectors(&oplog, a, b)?;
+
+        // Whether this container has ever carried a style is recorded where ops
+        // are registered, so the refusal is one lookup rather than a walk over the
+        // container's history. It has to cover the whole history and not just the
+        // window: the raw delta counts entity positions, which style anchors
+        // occupy, so an anchor created before `a` and merely retained across the
+        // window would shift every length with nothing in the delta to announce it.
+        if oplog.arena.is_container_styled(idx) {
+            return Err(LoroError::NotImplemented(
+                "diff_text_container does not support styled text: the container carries a style \
+                 op in its history",
+            ));
+        }
+
+        let mut calc = DiffCalculator::new(false);
+        let (diffs, _mode) = calc.calc_diff_internal(
+            &oplog,
+            &vv_a,
+            a,
+            &vv_b,
+            b,
+            Some(&|i: ContainerIdx| i == idx),
+        );
+
+        let Some(container_diff) = diffs.into_iter().find(|d| d.idx == idx) else {
+            return Ok(Vec::new());
+        };
+
+        let Ok(InternalDiff::RichtextRaw(delta)) = container_diff.diff.into_internal() else {
+            return Err(LoroError::ArgErr(
+                format!("container {} did not produce a text diff", cid).into_boxed_str(),
+            ));
+        };
+
+        let mut ans: Vec<TextDelta> = Vec::new();
+        for item in delta.iter() {
+            match item {
+                loro_delta::DeltaItem::Retain { len, .. } => {
+                    ans.push(TextDelta::Retain {
+                        retain: *len,
+                        attributes: None,
+                    });
+                }
+                loro_delta::DeltaItem::Replace { value, delete, .. } => {
+                    if *delete > 0 {
+                        ans.push(TextDelta::Delete { delete: *delete });
+                    }
+
+                    match value {
+                        RichtextStateChunk::Text(text) => {
+                            let inserted = text.as_str();
+                            if !inserted.is_empty() {
+                                ans.push(TextDelta::Insert {
+                                    insert: inserted.to_string(),
+                                    attributes: None,
+                                });
+                            }
+                        }
+                        RichtextStateChunk::Style { .. } => {
+                            // The recorded fact normally refuses a styled container
+                            // before the calculation runs. This catches the case
+                            // where it was not recorded -- history the document has
+                            // never decoded -- and the anchor turns up in the window
+                            // itself. It cannot catch an anchor outside the window,
+                            // which is why the recorded fact exists.
+                            return Err(LoroError::NotImplemented(
+                                "diff_text_container does not support styled text: the window \
+                                 inserts a style anchor",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(ans)
+    }
+
+    /// Both per-container history readers are scoped to text containers, so a
+    /// `cid` of any other type is a caller error rather than an answer about a
+    /// container this reader cannot describe.
+    fn require_text_container(cid: &ContainerID) -> LoroResult<()> {
+        if cid.container_type() != ContainerType::Text {
+            return Err(LoroError::ArgErr(
+                format!(
+                    "per-container history reads are only available for text containers, but {} \
+                     is a {:?} container",
+                    cid,
+                    cid.container_type()
+                )
+                .into_boxed_str(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// The container index the oplog's ops will resolve `cid` to.
+    ///
+    /// The arena's `id_to_idx` is a fast map over containers already registered,
+    /// not an existence check: a document restored from a snapshot registers its
+    /// containers lazily, so one that nothing has touched yet is absent from the
+    /// arena while its whole history sits in the oplog. Answering "not in the
+    /// arena" with "no history" would silently report such a container unchanged.
+    /// Consult what the document actually holds, and register the container so the
+    /// walk has an index the change blocks will agree with. A container that
+    /// exists nowhere is an error, not an answer.
+    fn resolve_container_for_history_read(
+        &self,
+        oplog: &OpLog,
+        cid: &ContainerID,
+    ) -> LoroResult<ContainerIdx> {
+        if let Some(idx) = oplog.arena.id_to_idx(cid) {
+            return Ok(idx);
+        }
+
+        // Reading whether a container exists neither moves the document nor emits
+        // an event. The oplog lock is taken before the state lock here, the order
+        // `diff` uses.
+        if !self.state.lock().does_container_exist(cid) {
+            return Err(LoroError::NotFoundError(
+                format!("container {} in this document", cid).into_boxed_str(),
+            ));
+        }
+
+        Ok(oplog.arena.register_container(cid))
+    }
+
+    /// The version vectors of two frontiers already proved to be in the dag.
+    fn history_read_version_vectors(
+        oplog: &OpLog,
+        a: &Frontiers,
+        b: &Frontiers,
+    ) -> LoroResult<(VersionVector, VersionVector)> {
+        let (Some(vv_a), Some(vv_b)) = (oplog.dag.frontiers_to_vv(a), oplog.dag.frontiers_to_vv(b))
+        else {
+            return Err(LoroError::Unknown(
+                "frontiers are in the dag but have no version vector".into(),
+            ));
+        };
+
+        Ok((vv_a, vv_b))
+    }
+
+    /// Whether any committed op on `idx` within `spans` satisfies `predicate`.
+    ///
+    /// A stored change can overhang the span it is found in at both ends, so its
+    /// ops are clipped to the span's counter range before being judged.
+    fn any_op_on_container(
+        oplog: &OpLog,
+        idx: ContainerIdx,
+        spans: impl Iterator<Item = IdSpan>,
+        mut predicate: impl FnMut(&crate::op::Op) -> bool,
+    ) -> bool {
+        for span in spans {
+            for change in oplog.change_store().iter_changes(span) {
+                let start_counter = span.counter.min().max(change.id.counter);
+                let end_counter = span.counter.norm_end();
+                let start = change
+                    .ops
+                    .binary_search_by(|op| op.ctr_last().cmp(&start_counter))
+                    .unwrap_or_else(|e| e);
+                for op in &change.ops.vec()[start..] {
+                    if op.counter >= end_counter {
+                        break;
+                    }
+
+                    if op.container == idx && predicate(op) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// The frontier check both per-container history readers share, in the shape
+    /// [`Self::diff`] performs it: a frontier naming an id the dag does not hold,
+    /// or one older than a shallow document's root, is an error rather than a
+    /// panic.
+    fn validate_frontiers_for_history_read(oplog: &OpLog, frontiers: &Frontiers) -> LoroResult<()> {
+        for id in frontiers.iter() {
+            if !oplog.dag.contains(id) {
+                return Err(LoroError::FrontiersNotFound(id));
+            }
+        }
+
+        if oplog.dag.is_before_shallow_root(frontiers) {
+            return Err(LoroError::SwitchToVersionBeforeShallowRoot);
+        }
+
+        Ok(())
+    }
+
     /// Apply a diff to the current state.
     #[inline(always)]
     pub fn apply_diff(&self, diff: DiffBatch) -> LoroResult<()> {
@@ -1967,6 +2289,16 @@ impl LoroDoc {
     }
 
     #[inline]
+    /// How many change blocks this document currently holds parsed in memory.
+    ///
+    /// Diagnostics. History written locally is parsed as it is written; history
+    /// that arrived in a snapshot stays encoded until something reads it, so a
+    /// freshly restored document reports zero however long its history is. Asking
+    /// loads nothing, unlike `len_changes`, which parses every block to count.
+    pub fn parsed_change_block_len(&self) -> usize {
+        self.oplog.lock().parsed_change_block_num()
+    }
+
     pub fn len_changes(&self) -> usize {
         let oplog = self.oplog.lock();
         oplog.len_changes()

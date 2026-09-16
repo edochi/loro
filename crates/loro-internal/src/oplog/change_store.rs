@@ -672,6 +672,17 @@ impl ChangeStore {
         block
     }
 
+    /// How many change blocks this store currently holds PARSED in memory.
+    ///
+    /// Blocks arrive either by being written locally, which leaves them parsed, or
+    /// inside a snapshot, which leaves them encoded in the external store until
+    /// something reads them. So this counts what has been decoded, not what exists:
+    /// a document restored from a snapshot reports zero until its history is read.
+    /// Unlike [`ChangeStore::change_num`] it loads nothing in order to answer.
+    pub fn parsed_block_num(&self) -> usize {
+        self.inner.lock().mem_parsed_kv.len()
+    }
+
     pub fn change_num(&self) -> usize {
         self.ensure_block_loaded_in_range(Bound::Unbounded, Bound::Unbounded);
         let mut inner = self.inner.lock();

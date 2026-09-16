@@ -3,6 +3,7 @@ fn init() {
     dev_utils::setup_test_log();
 }
 
+mod arena_rollback;
 mod import_atomicity;
 mod op_count;
 

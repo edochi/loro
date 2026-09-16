@@ -28,9 +28,9 @@
 //! flakier.
 #![cfg(not(loom))]
 
-use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, UndoManager, UndoScope};
+use loro::{ContainerID, ContainerTrait, ExportMode, Frontiers, LoroDoc, UndoManager, UndoScope};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// How many times the rewinding operation is performed. The reader samples for
@@ -515,4 +515,142 @@ fn state_only_export_at_a_merge_frontier_never_exposes_the_intermediate_moves() 
         "{}",
         observations.report("export(StateOnly) merge")
     );
+}
+
+/// A document with several containers and several commits, so a per-container
+/// history read has both a real window to walk and containers to filter out.
+fn doc_with_several_containers() -> (LoroDoc, Frontiers, Frontiers, ContainerID) {
+    let doc = LoroDoc::new();
+    for name in ["c0", "c1", "c2"] {
+        doc.get_text(name).insert(0, "hello").unwrap();
+    }
+    doc.commit();
+    let earlier = doc.state_frontiers();
+
+    for _ in 0..8 {
+        doc.get_text("c0").insert(0, "x").unwrap();
+        doc.get_text("c1").insert(0, "y").unwrap();
+        doc.commit();
+    }
+    let resting = doc.state_frontiers();
+
+    assert_ne!(earlier, resting);
+    let cid = doc.get_text("c0").id();
+    (doc, earlier, resting, cid)
+}
+
+/// The per-container readers answer from the oplog alone, so unlike `diff` and
+/// `fork_at` they never move the live document at all. The same racing oracle
+/// applies and is strictly stronger here: there is no window to be caught in, so
+/// a reader must see the resting version on every single sample.
+#[test]
+fn container_changed_between_never_moves_the_document() {
+    let (doc, earlier, resting, cid) = doc_with_several_containers();
+    let a = earlier;
+    let b = resting.clone();
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.container_changed_between(&cid, &a, &b).unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("container_changed_between")
+    );
+}
+
+#[test]
+fn diff_text_container_never_moves_the_document() {
+    let (doc, earlier, resting, cid) = doc_with_several_containers();
+    let a = earlier;
+    let b = resting.clone();
+    let observations = race_reader_against(doc, resting, move |doc| {
+        doc.diff_text_container(&cid, &a, &b).unwrap();
+    });
+    assert!(
+        observations.violations.is_empty(),
+        "{}",
+        observations.report("diff_text_container")
+    );
+}
+
+/// Neither reader detaches the document nor emits an event.
+///
+/// `diff` does both: it enters detached mode for the length of the walk, and the
+/// walk's checkouts are what its recording captures. A per-container read that
+/// quietly reused that machinery would pass the racing tests above on a fast
+/// enough machine but would still be visible here, where the oracle is the
+/// document's own attachment flag and its subscribers.
+#[test]
+fn neither_per_container_reader_detaches_the_doc_or_emits_an_event() {
+    let (doc, earlier, resting, cid) = doc_with_several_containers();
+
+    let events = Arc::new(AtomicUsize::new(0));
+    let counter = events.clone();
+    let _sub = doc.subscribe_root(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    assert!(
+        !doc.is_detached(),
+        "the fixture must start attached, or the detachment check below cannot fail"
+    );
+
+    assert!(doc
+        .container_changed_between(&cid, &earlier, &resting)
+        .unwrap());
+    assert!(!doc
+        .diff_text_container(&cid, &earlier, &resting)
+        .unwrap()
+        .is_empty());
+
+    assert!(
+        !doc.is_detached(),
+        "a per-container history read must leave the document attached"
+    );
+    assert_eq!(
+        doc.state_frontiers(),
+        resting,
+        "a per-container history read must leave the document where it rested"
+    );
+
+    // Subscribers are notified after a commit, so give any queued event the same
+    // chance to arrive that a real one would have.
+    doc.commit();
+    assert_eq!(
+        events.load(Ordering::SeqCst),
+        0,
+        "a per-container history read must emit no event"
+    );
+}
+
+/// The event oracle above is only meaningful if this subscriber does fire for an
+/// operation that legitimately produces an event, and if `diff` — the reader
+/// these APIs replace — is visibly detaching where they are not.
+#[test]
+fn the_isolation_oracles_fire_for_operations_that_are_not_isolated() {
+    let (doc, earlier, resting, _cid) = doc_with_several_containers();
+
+    let events = Arc::new(AtomicUsize::new(0));
+    let counter = events.clone();
+    let _sub = doc.subscribe_root(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    doc.get_text("c0").insert(0, "z").unwrap();
+    doc.commit();
+    assert!(
+        events.load(Ordering::SeqCst) > 0,
+        "an ordinary edit must notify the subscriber, or the no-event assertion elsewhere in \
+         this file cannot fail"
+    );
+
+    doc.set_detached_editing(true);
+    doc.checkout(&earlier).unwrap();
+    assert!(
+        doc.is_detached(),
+        "a checkout must set the detached flag, or the attachment assertion elsewhere in this \
+         file cannot fail"
+    );
+    doc.checkout_to_latest();
+    assert_ne!(earlier, resting);
 }

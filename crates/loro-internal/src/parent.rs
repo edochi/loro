@@ -10,8 +10,11 @@ use smallvec::SmallVec;
 use crate::{
     arena::SharedArena,
     change::Change,
-    container::{list::list_op::ListOp, map::MapSet},
-    op::{ListSlice, Op, RawOp, RawOpContent},
+    container::{
+        list::list_op::{InnerListOp, ListOp},
+        map::MapSet,
+    },
+    op::{InnerContent, ListSlice, Op, RawOp, RawOpContent},
     DocState, OpLog,
 };
 
@@ -32,6 +35,20 @@ pub(super) fn register_container_and_parent_link(arena: &SharedArena, change: &C
             let idx = arena.register_container(c);
             arena.set_parent(idx, Some(op.container));
         });
+
+        // Every change reaches this function exactly once, from a local commit or
+        // from decoding a stored block, so it is where a per-container fact about
+        // ops belongs. Whether a text container has ever carried a style is such a
+        // fact: style anchors occupy entity positions, so a reader that reports
+        // entity lengths cannot describe a styled container, and asking that
+        // question by walking history would cost a walk per question instead of
+        // one check per op here.
+        if matches!(
+            &op.content,
+            InnerContent::List(InnerListOp::StyleStart { .. } | InnerListOp::StyleEnd)
+        ) {
+            arena.mark_container_styled(op.container);
+        }
     }
 }
 
