@@ -203,28 +203,39 @@ impl Tracker {
         }
     }
 
+    /// Point the id-to-cursor index at the rope leaves listed in `split`, updating
+    /// each leaf's id span once.
+    ///
+    /// A leaf listed several times in a row is updated once. When a status change
+    /// splits one rope leaf at several id-to-cursor fragment boundaries, each piece
+    /// merges back into the leaf it was cut from, and the pieces are reinserted in
+    /// order, so the copies of one leaf are always adjacent. Updating each copy
+    /// would rewrite every fragment of the leaf's span once per piece, which is
+    /// quadratic in the length of the span.
     fn update_insert_by_split(&mut self, split: &[LeafIndex]) {
+        let mut leaves = split.chunk_by(|a, b| a == b).map(|run| run[0]);
+        let Some(first) = leaves.next() else {
+            return;
+        };
+        let Some(second) = leaves.next() else {
+            #[cfg(test)]
+            {
+                self.insert_updates_applied += 1;
+            }
+            let leaf = self.rope.tree().get_elem(first).unwrap();
+            self.id_to_cursor.update_insert(leaf.id_span(), first);
+            return;
+        };
+        let mut updates = Vec::with_capacity(split.len());
+        for new_leaf_idx in [first, second].into_iter().chain(leaves) {
+            let leaf = self.rope.tree().get_elem(new_leaf_idx).unwrap();
+            updates.push((leaf.id_span(), new_leaf_idx));
+        }
         #[cfg(test)]
         {
-            self.insert_updates_applied += split.len();
+            self.insert_updates_applied += updates.len();
         }
-        match split.len() {
-            0 => {}
-            1 => {
-                let new_leaf_idx = split[0];
-                let leaf = self.rope.tree().get_elem(new_leaf_idx).unwrap();
-                self.id_to_cursor
-                    .update_insert(leaf.id_span(), new_leaf_idx);
-            }
-            _ => {
-                let mut updates = Vec::with_capacity(split.len());
-                for &new_leaf_idx in split {
-                    let leaf = self.rope.tree().get_elem(new_leaf_idx).unwrap();
-                    updates.push((leaf.id_span(), new_leaf_idx));
-                }
-                self.id_to_cursor.update_insert_batch(&mut updates);
-            }
-        }
+        self.id_to_cursor.update_insert_batch(&mut updates);
     }
 
     /// Delete the element from pos..pos+len
@@ -1027,6 +1038,24 @@ mod test {
         let leaves = t.rope.tree().iter().count();
         assert_eq!(t.rope.len(), SPAN_LEN as usize);
         assert_eq!(t.insert_updates_applied, leaves);
+        t.check();
+    }
+
+    #[test]
+    fn a_leaf_listed_repeatedly_is_updated_once() {
+        const SPAN_LEN: u32 = 16;
+        const COPIES: usize = 4;
+        let mut t = Tracker::new();
+        t.insert(
+            IdFull::new(1, 0, 0),
+            0,
+            RichtextChunk::new_text(0..SPAN_LEN),
+        );
+        let leaf = t.rope.tree().first_leaf().unwrap();
+
+        t.insert_updates_applied = 0;
+        t.update_insert_by_split(&[leaf; COPIES]);
+        assert_eq!(t.insert_updates_applied, 1);
         t.check();
     }
 
