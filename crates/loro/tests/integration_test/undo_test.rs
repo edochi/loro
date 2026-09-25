@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{self, AtomicUsize},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{self, AtomicUsize},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use loro::{
@@ -1759,5 +1762,33 @@ fn undo_with_custom_commit_options() -> anyhow::Result<()> {
     assert_eq!(doc.get_text("text").to_string(), "Hello");
     doc.commit_with(CommitOptions::new().origin("undo_then_redo"));
     assert_eq!(trigger_times.load(atomic::Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+fn undo_one_large_text_insert_is_not_quadratic() -> LoroResult<()> {
+    /// Length of the single insert; large enough that a cost quadratic in it
+    /// takes far longer than the bound below.
+    const INSERT_LEN: usize = 512 * 1024;
+    /// Generous for an unoptimized build; a linear undo takes a small fraction.
+    const MAX_UNDO_TIME: Duration = Duration::from_secs(2);
+
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1)?;
+    let text = doc.get_text("text");
+    let mut undo = UndoManager::new(&doc);
+    text.insert(0, &"a".repeat(INSERT_LEN))?;
+    doc.commit();
+
+    let start = Instant::now();
+    assert!(undo.undo()?);
+    let elapsed = start.elapsed();
+    println!("undo of a {INSERT_LEN}-char insert took {elapsed:?}");
+
+    assert_eq!(text.to_string(), "");
+    assert!(
+        elapsed < MAX_UNDO_TIME,
+        "undo took {elapsed:?}, bound {MAX_UNDO_TIME:?}"
+    );
     Ok(())
 }

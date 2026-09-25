@@ -1,5 +1,5 @@
 use loro::{ExportMode, LoroDoc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[test]
 #[ignore]
@@ -92,5 +92,48 @@ fn perf_import_insert_split_quadratic_e2e() {
     println!(
         "perf_import_insert_split_quadratic_e2e: doc_len={}, fragments={}, expected_fragment_updates={}, elapsed={:?}",
         doc_len, fragments, expected_fragment_updates, elapsed
+    );
+}
+
+#[test]
+fn import_one_large_text_insert_is_not_quadratic() {
+    // The receiving document seeded the base text itself, so its history of
+    // the text is local; importing the large insert then walks it in the
+    // tracker, which is where the cost was quadratic in the insert's length.
+    // A receiver that got its base by import did not show the same cost.
+    /// Length of the single imported insert.
+    const INSERT_LEN: usize = 512 * 1024;
+    /// Generous for an unoptimized build; a linear import takes a small fraction.
+    const MAX_IMPORT_TIME: Duration = Duration::from_secs(2);
+    const BASE: &str = "base";
+
+    let receiver = LoroDoc::new();
+    receiver.set_peer_id(1).unwrap();
+    receiver.get_text("t").insert(0, BASE).unwrap();
+    receiver.commit();
+
+    let sender = LoroDoc::new();
+    sender.set_peer_id(2).unwrap();
+    sender
+        .import(&receiver.export(ExportMode::all_updates()).unwrap())
+        .unwrap();
+    let before = sender.oplog_vv();
+    let large = "a".repeat(INSERT_LEN);
+    sender.get_text("t").insert(BASE.len(), &large).unwrap();
+    sender.commit();
+    let update = sender.export(ExportMode::updates(&before)).unwrap();
+
+    let start = Instant::now();
+    receiver.import(&update).unwrap();
+    let elapsed = start.elapsed();
+    println!("import of a {INSERT_LEN}-char insert took {elapsed:?}");
+
+    assert_eq!(
+        receiver.get_text("t").len_unicode(),
+        BASE.len() + INSERT_LEN
+    );
+    assert!(
+        elapsed < MAX_IMPORT_TIME,
+        "import took {elapsed:?}, bound {MAX_IMPORT_TIME:?}"
     );
 }

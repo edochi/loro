@@ -29,6 +29,9 @@ pub(crate) struct Tracker {
     current_vv: VersionVector,
     rope: CrdtRope,
     id_to_cursor: IdToCursor,
+    /// Number of leaf entries handed to `IdToCursor` by `update_insert_by_split`.
+    #[cfg(test)]
+    insert_updates_applied: usize,
 }
 
 impl Default for Tracker {
@@ -80,6 +83,8 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            #[cfg(test)]
+            insert_updates_applied: 0,
         };
 
         let result = this.rope.tree.push(FugueSpan {
@@ -109,6 +114,8 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            #[cfg(test)]
+            insert_updates_applied: 0,
         }
     }
 
@@ -197,6 +204,10 @@ impl Tracker {
     }
 
     fn update_insert_by_split(&mut self, split: &[LeafIndex]) {
+        #[cfg(test)]
+        {
+            self.insert_updates_applied += split.len();
+        }
         match split.len() {
             0 => {}
             1 => {
@@ -988,6 +999,35 @@ mod test {
         assert_eq!(v[0].rle_len(), 4);
         assert!(v[1].is_activated());
         assert_eq!(v[1].rle_len(), 6);
+    }
+
+    #[test]
+    fn checkout_of_one_large_insert_updates_its_leaf_once() {
+        // One insert this long is tracked as many id-to-cursor fragments that all
+        // point at the same rope leaf. Flipping its status splits the leaf at every
+        // fragment boundary and the pieces merge back into that leaf, so the leaf
+        // must be reported to the id-to-cursor index once, not once per piece.
+        const SPAN_LEN: u32 = 300 * 1024;
+        const PEER: PeerID = 1;
+        let mut t = Tracker::new();
+        t.insert(
+            IdFull::new(PEER, 0, 0),
+            0,
+            RichtextChunk::new_text(0..SPAN_LEN),
+        );
+
+        t.insert_updates_applied = 0;
+        t.checkout(&vv!(PEER => 0));
+        let leaves = t.rope.tree().iter().count();
+        assert_eq!(t.rope.len(), 0);
+        assert_eq!(t.insert_updates_applied, leaves);
+
+        t.insert_updates_applied = 0;
+        t.checkout(&vv!(PEER => SPAN_LEN as Counter));
+        let leaves = t.rope.tree().iter().count();
+        assert_eq!(t.rope.len(), SPAN_LEN as usize);
+        assert_eq!(t.insert_updates_applied, leaves);
+        t.check();
     }
 
     #[test]

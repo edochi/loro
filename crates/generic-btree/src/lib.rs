@@ -1388,6 +1388,8 @@ impl<B: BTreeTrait> BTree<B> {
     /// - There can be multiple ranges in the same leaf node.
     /// - The cahce will be recalculated for each affected node
     /// - It doesn't guarantee the applying order
+    /// - Returns the leaves that received the split-off parts, each once, even
+    ///   when several parts merged back into the same leaf
     ///
     /// Currently, the time complexity is O(m^2) for each leaf node,
     /// where m is the number of ranges inside the same leaf node.
@@ -1489,7 +1491,12 @@ impl<B: BTreeTrait> BTree<B> {
                 // PERF can use insert many to optimize when it's supported
                 let result = self.insert_by_path(cursor, elem);
                 let len = self.get_elem(result.0.leaf).unwrap().rle_len();
-                new_leaves.push(result.0.leaf);
+                // A piece that merges into the leaf before it lands in that same
+                // leaf, and the pieces of one leaf are inserted in order, so a
+                // repeated leaf is always adjacent to its previous report.
+                if new_leaves.last() != Some(&result.0.leaf) {
+                    new_leaves.push(result.0.leaf);
+                }
                 debug_assert_eq!(result.1.arr.len(), 0);
                 cursor = Cursor {
                     leaf: result.0.leaf,
